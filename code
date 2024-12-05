@@ -1,0 +1,396 @@
+# import pandas as pd
+# import numpy as np
+# import lightgbm as lgb
+# import xgboost as xgb
+# import catboost as cb
+# from sklearn.model_selection import train_test_split, GridSearchCV
+# from sklearn.metrics import mean_squared_error, make_scorer, roc_auc_score
+# from sklearn.ensemble import StackingClassifier
+# from sklearn.linear_model import LogisticRegression
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import xgboost as xgb
+import catboost as cb
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import make_scorer, roc_auc_score
+from sklearn.ensemble import StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.optimizers import Adam
+# Data Cleaning and Preprocessing
+from keras.callbacks import EarlyStopping
+DOUBLE11_DAY = 184
+DIR_1 = 
+DIR_2 = 'data_format2/'
+
+# PATH_TRAIN = DIR_1 + 'train_format1.csv'
+# PATH_TEST = DIR_1 + 'test_format1.csv'
+# PATH_USER_INFO = DIR_1 + 'user_info_format1.csv'
+# PATH_USER_LOG = DIR_1 + 'user_log_format1.csv'
+PATH_TRAIN =
+PATH_TEST =
+PATH_USER_INFO = 
+PATH_USER_LOG = 
+df_train = pd.read_csv(PATH_TRAIN)
+df_test = pd.read_csv(PATH_TEST)  # This data has NaN for the probabilities, the task is to predict the NaN values.
+df_user_info = pd.read_csv(PATH_USER_INFO)
+df_user_log = pd.read_csv(PATH_USER_LOG)
+
+# Basic Data Preprocessing
+df_user_log.rename(columns={'seller_id': 'merchant_id'}, inplace=True)
+
+df_user_log['brand_id'].fillna(0, inplace=True)
+df_user_log['time_stamp'] = (pd.to_datetime(df_user_log['time_stamp'], format='%m%d') - pd.to_datetime(df_user_log['time_stamp'].min(), format='%m%d')).dt.days
+
+# Optimize memory usage by converting data types
+df_user_log['user_id'] = df_user_log['user_id'].astype('int32')
+df_user_log['item_id'] = df_user_log['item_id'].astype('int32')
+df_user_log['cat_id'] = df_user_log['cat_id'].astype('int16')
+df_user_log['merchant_id'] = df_user_log['merchant_id'].astype('int16')
+df_user_log['brand_id'] = df_user_log['brand_id'].astype('int16')
+df_user_log['time_stamp'] = df_user_log['time_stamp'].astype('int16')
+df_user_log['action_type'] = df_user_log['action_type'].astype('int8')
+
+df_user_info['gender'].fillna(2, inplace=True)  # 0 for female, 1 for male, 2 and NULL for unknown.
+df_user_info['gender'] = df_user_info['gender'].astype('int8')
+df_user_info['age_range'].fillna(0, inplace=True)  # 1 for <18; 2 for [18,24]; 3 for [25,29]; 4 for [30,34]; 5 for [35,39]; 6 for [40,49]; 7 and 8 for >= 50; 0 and NULL for unknown.
+df_user_info['age_range'] = df_user_info['age_range'].astype('int8')
+df_user_info['user_id'] = df_user_info['user_id'].astype('int32')
+
+# Feature Engineering
+df_user_log['time_month'] = df_user_log['time_stamp'] // 30
+df_user_log['time_week'] = df_user_log['time_stamp'] // 7
+
+# Grouping merchants, users, and user-merchant pairs
+merchants = df_user_log.groupby('merchant_id')
+users = df_user_log.groupby('user_id')
+merchants_users = df_user_log.groupby(['merchant_id', 'user_id'])
+
+# Features: Merchant and User Statistics
+to_merge = merchants.nunique().reset_index().rename(columns={'item_id': 'items_merchant', 'cat_id': 'categories_merchant', 'user_id': 'users_merchant', 'brand_id': 'brands_merchant'})
+df_train = df_train.merge(to_merge, on='merchant_id', how='left')
+
+to_merge = users.nunique().reset_index().rename(columns={'item_id': 'items_user', 'cat_id': 'categories_user', 'merchant_id': 'merchants_user', 'brand_id': 'brands_user'})
+df_train = df_train.merge(to_merge, on='user_id', how='left')
+
+to_merge = merchants_users.nunique().reset_index().rename(columns={'item_id': 'items_user_merchant', 'cat_id': 'categories_user_merchant', 'brand_id': 'brands_user_merchant'})
+df_train = df_train.merge(to_merge, on=['user_id', 'merchant_id'], how='left')
+
+# Adding action type features
+to_merge = users['action_type'].value_counts().unstack(fill_value=0).rename(columns={0: 'clicks_user', 1: 'add_to_carts_user', 2: 'purchases_user', 3: 'add_to_favorites_user'})
+df_train = df_train.merge(to_merge, on='user_id', how='left')
+
+to_merge = merchants['action_type'].value_counts().unstack(fill_value=0).rename(columns={0: 'clicks_merchant', 1: 'add_to_carts_merchant', 2: 'purchases_merchant', 3: 'add_to_favorites_merchant'})
+df_train = df_train.merge(to_merge, on='merchant_id', how='left')
+
+to_merge = merchants_users['action_type'].value_counts().unstack(fill_value=0).rename(columns={0: 'clicks_user_merchant', 1: 'add_to_carts_user_merchant', 2: 'purchases_user_merchant', 3: 'add_to_favorites_user_merchant'})
+df_train = df_train.merge(to_merge, on=['user_id', 'merchant_id'], how='left')
+
+# Ratio Features
+EPS = 1e-8
+df_train['clicks_in_user_ratio'] = df_train['clicks_user_merchant'] / (df_train['clicks_merchant'] + EPS)
+df_train['carts_in_user_ratio'] = df_train['add_to_carts_user_merchant'] / (df_train['add_to_carts_merchant'] + EPS)
+df_train['purchases_in_user_ratio'] = df_train['purchases_user_merchant'] / (df_train['purchases_merchant'] + EPS)
+df_train['favourites_in_user_ratio'] = df_train['add_to_favorites_user_merchant'] / (df_train['add_to_favorites_merchant'] + EPS)
+
+df_train['clicks_in_merchant_ratio'] = df_train['clicks_user_merchant'] / (df_train['clicks_user'] + EPS)
+df_train['carts_in_merchant_ratio'] = df_train['add_to_carts_user_merchant'] / (df_train['add_to_carts_user'] + EPS)
+df_train['purchases_in_merchant_ratio'] = df_train['purchases_user_merchant'] / (df_train['purchases_user'] + EPS)
+df_train['favourites_in_merchant_ratio'] = df_train['add_to_favorites_user_merchant'] / (df_train['add_to_favorites_user'] + EPS)
+
+df_train['temporary_total_actions_merchant'] = (df_train['clicks_merchant'] + df_train['add_to_carts_merchant'] + df_train['purchases_merchant'] + df_train['add_to_favorites_merchant'] + EPS)
+df_train['clicks_ratio_merchant'] = df_train['clicks_merchant'] / (df_train['temporary_total_actions_merchant'])
+df_train['carts_ratio_merchant'] = df_train['add_to_carts_merchant'] / (df_train['temporary_total_actions_merchant'])
+df_train['purchases_ratio_merchant'] = df_train['purchases_merchant'] / (df_train['temporary_total_actions_merchant'])
+df_train['favourites_ratio_merchant'] = df_train['add_to_favorites_merchant'] / (df_train['temporary_total_actions_merchant'])
+df_train.drop('temporary_total_actions_merchant', axis=1, inplace=True)
+
+df_train['temporary_total_actions_user'] = (df_train['clicks_user'] + df_train['add_to_carts_user'] + df_train['purchases_user'] + df_train['add_to_favorites_user'] + EPS)
+df_train['clicks_ratio_user'] = df_train['clicks_user'] / (df_train['temporary_total_actions_user'])
+df_train['carts_ratio_user'] = df_train['add_to_carts_user'] / (df_train['temporary_total_actions_user'])
+df_train['purchases_ratio_user'] = df_train['purchases_user'] / (df_train['temporary_total_actions_user'])
+df_train['favourites_ratio_user'] = df_train['add_to_favorites_user'] / (df_train['temporary_total_actions_user'])
+df_train.drop('temporary_total_actions_user', axis=1, inplace=True)
+
+df_train['temporary_total_actions_user_merchant'] = (df_train['clicks_user_merchant'] + df_train['add_to_carts_user_merchant'] + df_train['purchases_user_merchant'] + df_train['add_to_favorites_user_merchant'] + EPS)
+df_train['clicks_ratio_user_merchant'] = df_train['clicks_user_merchant'] / (df_train['temporary_total_actions_user_merchant'])
+df_train['carts_ratio_user_merchant'] = df_train['add_to_carts_user_merchant'] / (df_train['temporary_total_actions_user_merchant'])
+df_train['purchases_ratio_user_merchant'] = df_train['purchases_user_merchant'] / (df_train['temporary_total_actions_user_merchant'])
+df_train['favourites_ratio_user_merchant'] = df_train['add_to_favorites_user_merchant'] / (df_train['temporary_total_actions_user_merchant'])
+df_train.drop('temporary_total_actions_user_merchant', axis=1, inplace=True)
+
+
+
+# # # 1. 读取和清理测试集
+# # df_test = pd.read_csv(PATH_TEST)
+# #
+# # # 对测试集进行相同的预处理步骤
+# # df_user_log = df_test.copy()
+#
+# # 将"seller_id"列重命名为"merchant_id"
+# df_user_log.rename(columns={'seller_id': 'merchant_id'}, inplace=True)
+#
+# # 填充缺失值
+# df_user_log['brand_id'].fillna(0, inplace=True)
+# df_user_log['time_stamp'] = (pd.to_datetime(df_user_log['time_stamp'], format='%m%d') - pd.to_datetime(df_user_log['time_stamp'].min(), format='%m%d')).dt.days
+#
+# # 优化内存
+# df_user_log['user_id'] = df_user_log['user_id'].astype('int32')
+# df_user_log['item_id'] = df_user_log['item_id'].astype('int32')
+# df_user_log['cat_id'] = df_user_log['cat_id'].astype('int16')
+# df_user_log['merchant_id'] = df_user_log['merchant_id'].astype('int16')
+# df_user_log['brand_id'] = df_user_log['brand_id'].astype('int16')
+# df_user_log['time_stamp'] = df_user_log['time_stamp'].astype('int16')
+# df_user_log['action_type'] = df_user_log['action_type'].astype('int8')
+#
+# # 2. 对df_user_info做相同的预处理
+# df_user_info = df_user_info.copy()
+#
+# df_user_info['gender'].fillna(2, inplace=True)  # 0 for female, 1 for male, 2 and NULL for unknown.
+# df_user_info['gender'] = df_user_info['gender'].astype('int8')
+# df_user_info['age_range'].fillna(0, inplace=True)  # 1 for <18; 2 for [18,24]; 3 for [25,29]; 4 for [30,34]; 5 for [35,39]; 6 for [40,49]; 7 and 8 for >= 50; 0 and NULL for unknown.
+# df_user_info['age_range'] = df_user_info['age_range'].astype('int8')
+# df_user_info['user_id'] = df_user_info['user_id'].astype('int32')
+#
+# # 3. 添加时间特征（与训练集相同的操作）
+# df_user_log['time_month'] = df_user_log['time_stamp'] // 30
+# df_user_log['time_week'] = df_user_log['time_stamp'] // 7
+#
+# # 4. 计算商户、用户以及商户用户对的统计特征
+# merchants = df_user_log.groupby('merchant_id')
+# users = df_user_log.groupby('user_id')
+# merchants_users = df_user_log.groupby(['merchant_id', 'user_id'])
+
+# 商户统计特征
+to_merge = merchants.nunique().reset_index().rename(columns={'item_id': 'items_merchant', 'cat_id': 'categories_merchant', 'user_id': 'users_merchant', 'brand_id': 'brands_merchant'})
+df_test = df_test.merge(to_merge, on='merchant_id', how='left')
+
+# 用户统计特征
+to_merge = users.nunique().reset_index().rename(columns={'item_id': 'items_user', 'cat_id': 'categories_user', 'merchant_id': 'merchants_user', 'brand_id': 'brands_user'})
+df_test = df_test.merge(to_merge, on='user_id', how='left')
+
+# 商户用户对统计特征
+to_merge = merchants_users.nunique().reset_index().rename(columns={'item_id': 'items_user_merchant', 'cat_id': 'categories_user_merchant', 'brand_id': 'brands_user_merchant'})
+df_test = df_test.merge(to_merge, on=['user_id', 'merchant_id'], how='left')
+
+# 5. 添加操作类型特征
+# 用户的操作类型统计
+to_merge = users['action_type'].value_counts().unstack(fill_value=0).rename(columns={0: 'clicks_user', 1: 'add_to_carts_user', 2: 'purchases_user', 3: 'add_to_favorites_user'})
+df_test = df_test.merge(to_merge, on='user_id', how='left')
+
+# 商户的操作类型统计
+to_merge = merchants['action_type'].value_counts().unstack(fill_value=0).rename(columns={0: 'clicks_merchant', 1: 'add_to_carts_merchant', 2: 'purchases_merchant', 3: 'add_to_favorites_merchant'})
+df_test = df_test.merge(to_merge, on='merchant_id', how='left')
+
+# 商户用户对的操作类型统计
+to_merge = merchants_users['action_type'].value_counts().unstack(fill_value=0).rename(columns={0: 'clicks_user_merchant', 1: 'add_to_carts_user_merchant', 2: 'purchases_user_merchant', 3: 'add_to_favorites_user_merchant'})
+df_test = df_test.merge(to_merge, on=['user_id', 'merchant_id'], how='left')
+
+# 6. 添加比例特征
+EPS = 1e-8
+df_test['clicks_in_user_ratio'] = df_test['clicks_user_merchant'] / (df_test['clicks_merchant'] + EPS)
+df_test['carts_in_user_ratio'] = df_test['add_to_carts_user_merchant'] / (df_test['add_to_carts_merchant'] + EPS)
+df_test['purchases_in_user_ratio'] = df_test['purchases_user_merchant'] / (df_test['purchases_merchant'] + EPS)
+df_test['favourites_in_user_ratio'] = df_test['add_to_favorites_user_merchant'] / (df_test['add_to_favorites_merchant'] + EPS)
+
+df_test['clicks_in_merchant_ratio'] = df_test['clicks_user_merchant'] / (df_test['clicks_user'] + EPS)
+df_test['carts_in_merchant_ratio'] = df_test['add_to_carts_user_merchant'] / (df_test['add_to_carts_user'] + EPS)
+df_test['purchases_in_merchant_ratio'] = df_test['purchases_user_merchant'] / (df_test['purchases_user'] + EPS)
+df_test['favourites_in_merchant_ratio'] = df_test['add_to_favorites_user_merchant'] / (df_test['add_to_favorites_user'] + EPS)
+
+df_test['temporary_total_actions_merchant'] = (df_test['clicks_merchant'] + df_test['add_to_carts_merchant'] + df_test['purchases_merchant'] + df_test['add_to_favorites_merchant'] + EPS)
+df_test['clicks_ratio_merchant'] = df_test['clicks_merchant'] / (df_test['temporary_total_actions_merchant'])
+df_test['carts_ratio_merchant'] = df_test['add_to_carts_merchant'] / (df_test['temporary_total_actions_merchant'])
+df_test['purchases_ratio_merchant'] = df_test['purchases_merchant'] / (df_test['temporary_total_actions_merchant'])
+df_test['favourites_ratio_merchant'] = df_test['add_to_favorites_merchant'] / (df_test['temporary_total_actions_merchant'])
+df_test.drop('temporary_total_actions_merchant', axis=1, inplace=True)
+
+df_test['temporary_total_actions_user'] = (df_test['clicks_user'] + df_test['add_to_carts_user'] + df_test['purchases_user'] + df_test['add_to_favorites_user'] + EPS)
+df_test['clicks_ratio_user'] = df_test['clicks_user'] / (df_test['temporary_total_actions_user'])
+df_test['carts_ratio_user'] = df_test['add_to_carts_user'] / (df_test['temporary_total_actions_user'])
+df_test['purchases_ratio_user'] = df_test['purchases_user'] / (df_test['temporary_total_actions_user'])
+df_test['favourites_ratio_user'] = df_test['add_to_favorites_user'] / (df_test['temporary_total_actions_user'])
+df_test.drop('temporary_total_actions_user', axis=1, inplace=True)
+
+df_test['temporary_total_actions_user_merchant'] = (df_test['clicks_user_merchant'] + df_test['add_to_carts_user_merchant'] + df_test['purchases_user_merchant'] + df_test['add_to_favorites_user_merchant'] + EPS)
+df_test['clicks_ratio_user_merchant'] = df_test['clicks_user_merchant'] / (df_test['temporary_total_actions_user_merchant'])
+df_test['carts_ratio_user_merchant'] = df_test['add_to_carts_user_merchant'] / (df_test['temporary_total_actions_user_merchant'])
+df_test['purchases_ratio_user_merchant'] = df_test['purchases_user_merchant'] / (df_test['temporary_total_actions_user_merchant'])
+df_test['favourites_ratio_user_merchant'] = df_test['add_to_favorites_user_merchant'] / (df_test['temporary_total_actions_user_merchant'])
+df_test.drop('temporary_total_actions_user_merchant', axis=1, inplace=True)
+
+# # 7. 保留特征并预测 'probability' (将probability列剔除)
+# X_test = df_test.drop(columns=['probability'])
+
+# Now you can use the model to predict the 'probability' column on X_test
+
+# 在开始训练之前添加提醒
+
+print("开始训练过程...")
+# # Splitting into train and test
+# X = df_train.drop(['probability'], axis=1)
+# y = df_train['probability']
+#
+# X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2, random_state=42)
+#
+# # Define the models
+# # lgbm = lgb.LGBMClassifier(n_estimators=100)
+# xgb_model = xgb.XGBClassifier(n_estimators=10, tree_method='gpu_hist', gpu_id=0)
+# catboost_model = cb.CatBoostClassifier(iterations=10, learning_rate=0.05, depth=5, silent=True, task_type='GPU',  train_dir=r"C:\Users\25442\Desktop\data_format1\data_format1\5")
+#
+# # Define the hyperparameter grids
+# # lgbm_param_grid = {
+# #     'n_estimators': [50, 100, 150],
+# #     'learning_rate': [0.01, 0.05, 0.1],
+# #     'max_depth': [6, 8, 10],
+# #     'num_leaves': [31, 50, 70]
+# # }
+#
+# xgb_param_grid = {
+#     'n_estimators': [50, 100, 150],
+#     'learning_rate': [0.01, 0.05, 0.1],
+#     'max_depth': [6, 8, 10],
+#     'subsample': [0.7, 0.8, 0.9],
+#     'colsample_bytree': [0.7, 0.8, 0.9]
+# }
+#
+# catboost_param_grid = {
+#     'iterations': [50, 100, 150],
+#     'learning_rate': [0.01, 0.05, 0.1],
+#     'depth': [6, 8, 10],
+#     'l2_leaf_reg': [3, 5, 7]
+# }
+#
+# # Define the scorer
+# roc_auc_scorer = make_scorer(roc_auc_score, greater_is_better=True)
+#
+# # Perform GridSearchCV for each model
+# # lgbm_grid_search = GridSearchCV(estimator=lgbm, param_grid=lgbm_param_grid, cv=5, scoring=roc_auc_scorer, n_jobs=-1)
+# # lgbm_grid_search.fit(X_train, y_train)
+#
+# xgb_grid_search = GridSearchCV(estimator=xgb_model, param_grid=xgb_param_grid, cv=5, scoring=roc_auc_scorer, n_jobs=-1)
+# xgb_grid_search.fit(X_train, y_train)
+#
+# catboost_grid_search = GridSearchCV(estimator=catboost_model, param_grid=catboost_param_grid, cv=5, scoring=roc_auc_scorer, n_jobs=-1)
+# catboost_grid_search.fit(X_train, y_train)
+#
+# # Use the best models for stacking
+# # best_lgbm = lgbm_grid_search.best_estimator_
+# best_xgb = xgb_grid_search.best_estimator_
+# best_catboost = catboost_grid_search.best_estimator_
+#
+# # Stacking model with tuned models
+# # stacking_model = StackingClassifier(
+# #     estimators=[('lgbm', best_lgbm), ('xgb', best_xgb), ('catboost', best_catboost)],
+# #     final_estimator=LogisticRegression()
+# # )
+# stacking_model = StackingClassifier(
+#     estimators=[('xgb', best_xgb), ('catboost', best_catboost)],
+#     final_estimator=LogisticRegression()
+# )
+# # Fit the stacking model
+# stacking_model.fit(X_train, y_train)
+#
+# # Predict on validation set
+# y_pred = stacking_model.predict(X_valid)
+# # 对测试集进行预测
+# df_test['probability'] = stacking_model.predict(df_test.drop(['probability'], axis=1))
+#
+# # 输出结果到csv文件
+# df_test[['user_id', 'merchant_id', 'probability']].to_csv('predictions.csv', index=False)
+# Split the data
+
+# 分割特征和目标值
+X = df_train.drop(['probability'], axis=1)  # 将 'probability' 作为目标值，剩余的列作为特征
+y = df_train['probability']
+
+# 拆分训练集和验证集
+X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.5, random_state=42)
+
+print("训练集和验证集已经成功拆分")
+# # Split data into training and validation sets
+# X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.5, random_state=42)
+
+# Neural Network Model using Keras
+print(df_train.columns)
+
+def create_nn_model():
+    model = Sequential()
+    model.add(Dense(64, input_dim=X_train.shape[1], activation='relu'))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dense(1, activation='sigmoid'))  # Output layer for binary classification
+    model.compile(optimizer=Adam(), loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+# Create the neural network model
+nn_model = create_nn_model()
+
+# EarlyStopping callback
+early_stopping = EarlyStopping(monitor='val_loss',  # Monitor validation loss
+                               patience=5,  # Number of epochs to wait before stopping
+                               restore_best_weights=True,  # Restore the best weights after stopping
+                               verbose=1)
+
+# Train the Neural Network with validation data and early stopping
+nn_model.fit(X_train, y_train, epochs=100, batch_size=32, verbose=1,
+             validation_data=(X_valid, y_valid),  # Use validation data
+             callbacks=[early_stopping])  # Add early stopping callback
+
+# Define the XGBoost model (remains the same as before)
+xgb_model = xgb.XGBClassifier(n_estimators=10, learning_rate=0.05,max_depth=7,n_jobs=-1)
+
+# Hyperparameter grid for XGBoost
+xgb_param_grid = {
+    'n_estimators': [7, 15],
+    'subsample': [0.8, 0.9],
+}
+
+# Perform GridSearchCV for XGBoost (same as before)
+roc_auc_scorer = make_scorer(roc_auc_score, greater_is_better=True)
+xgb_grid_search = GridSearchCV(estimator=xgb_model, param_grid=xgb_param_grid, cv=2, scoring=roc_auc_scorer, n_jobs=-1)
+xgb_grid_search.fit(X_train, y_train)
+
+# Use the best XGBoost model from GridSearch
+best_xgb = xgb_grid_search.best_estimator_
+
+# # StackingClassifier with XGBoost and Neural Network
+# stacking_model = StackingClassifier(
+#     estimators=[('xgb', best_xgb), ('nn', nn_model)],
+#     final_estimator=LogisticRegression()
+# )
+#
+# # Fit the stacking model
+# stacking_model.fit(X_train, y_train)
+
+# Predict on the validation set
+# y_pred = stacking_model.predict(X_valid)
+# 1. 对神经网络进行预测
+# nn_pred_train = nn_model.predict(X_train)  # 神经网络在训练集上的预测
+nn_pred_valid = nn_model.predict(X_valid)  # 神经网络在验证集上的预测
+nn_pred_test = nn_model.predict(df_test.drop(['probability'], axis=1))  # 神经网络在测试集上的预测
+
+# 2. 对XGBoost进行预测
+# xgb_pred_train = best_xgb.predict_proba(X_train)[:, 1]  # XGBoost在训练集上的预测概率
+xgb_pred_valid = best_xgb.predict_proba(X_valid)[:, 1]  # XGBoost在验证集上的预测概率
+xgb_pred_test = best_xgb.predict_proba(df_test.drop(['probability'], axis=1))[:, 1]  # XGBoost在测试集上的预测概率
+
+# 3. 对预测概率进行平均
+train_pred_avg = (nn_pred_train.flatten()*0.7 + xgb_pred_train*0.3)
+valid_pred_avg = (nn_pred_valid.flatten()*0.7 + xgb_pred_valid*0.3)
+test_pred_avg = (nn_pred_test.flatten()*0.7 + xgb_pred_test*0.3)
+
+# 4. 对验证集进行评估
+print("Validation ROC AUC Score (Average Prediction):", roc_auc_score(y_valid, valid_pred_avg))
+
+# 5. 输出测试集的预测结果
+df_test['probability'] = test_pred_avg
+df_test[['user_id', 'merchant_id', 'probability']].to_csv('predictions.csv', index=False)
+
+# # Predict on the test set
+# df_test['probability'] = stacking_model.predict(df_test.drop(['probability'], axis=1))
+#
+# # Output the predictions to a CSV file
+# df_test[['user_id', 'merchant_id', 'probability']].to_csv('predictions.csv', index=False)
